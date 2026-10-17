@@ -2,11 +2,17 @@ import html
 import os
 import re
 import sys
+import json
 from pathlib import Path
+from typing import Any
 
 import requests
+from tools import ReadGitHubFilesParams, read_github_files, tools
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from pydantic import ValidationError
+
 
 load_dotenv()
 
@@ -63,9 +69,9 @@ def fetch_pull_request(
     owner: str,
     repo: str,
     issue_num: int,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{issue_num}"
-
+    
     response = requests.get(url, headers=GITHUB_HEADERS)
 
     if response.status_code != 200:
@@ -79,8 +85,12 @@ def fetch_pull_request(
         "author": data["user"]["login"],
         "created_at": data["created_at"],
         "url": data["html_url"],
+        "file_context": {
+            "owner": data["head"]["repo"]["owner"]["login"],
+            "repo": data["head"]["repo"]["name"],
+            "ref": data["head"]["sha"],
+        },
     }
-
 
 def fetch_comments(
     owner: str,
@@ -136,7 +146,7 @@ def format_comments(comments: list[dict[str, str]]) -> str:
 
 
 def generate_pr_report(
-    pr_info: dict[str, str],
+    pr_info: dict[str, Any],
     diff: str,
     comments: list[dict[str, str]],
     user_interpretation: str,
@@ -156,6 +166,11 @@ def generate_pr_report(
   <author>{html.escape(pr_info['author'])}</author>
   <created-at>{html.escape(pr_info['created_at'])}</created-at>
   <url>{html.escape(pr_info['url'])}</url>
+  <file_context>
+    <owner>{html.escape(pr_info['file_context']['owner'])}</owner>
+    <repo>{html.escape(pr_info['file_context']['repo'])}</repo>
+    <ref>{html.escape(pr_info['file_context']['ref'])}</ref>
+  </file_context>
   <description>
 {html.escape(pr_info['body'])}
   </description>
@@ -185,16 +200,79 @@ def generate_pr_report(
         api_key=OPENROUTER_API_KEY,
     )
 
-    completion = client.chat.completions.create(
-        model="google/gemini-2.5-flash",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    return completion.choices[0].message.content
+    max_iterations = 5
+    iteration = 0
 
+    while iteration < max_iterations:
+        iteration += 1
+
+        response = client.chat.completions.create(
+            model="google/gemini-2.5-flash",
+            messages=messages,
+            tools=tools,
+        )
+
+        assistant_message = response.choices[0].message
+
+        # Check if there is a tool call to be done; if none, we have the final report
+        if not assistant_message.tool_calls:
+            return assistant_message.content or ""
+
+        # Maintain conversation history with the assistant's tool call intent
+        messages.append(assistant_message)
+
+        # Execute each requested tool call
+        for tool_call in assistant_message.tool_calls:
+            function_name = tool_call.function.name
+
+            if function_name == "read_github_files":
+                try:
+                    args = ReadGitHubFilesParams.model_validate_json(
+                        tool_call.function.arguments
+                    )
+
+                    files = []
+                    for file in args.files:
+                        item = file.model_dump()
+                        # Apply defaults when start_line or max_lines is null
+                        item["start_line"] = (
+                            1 if file.start_line is None else file.start_line
+                        )
+                        item["max_lines"] = (
+                            500 if file.max_lines is None else file.max_lines
+                        )
+                        files.append(item)
+                        print(
+                            f"[Tool Call] read_github_files: path='{item['path']}', "
+                            f"lines {item['start_line']} to {item['start_line'] + item['max_lines'] - 1} "
+                            f"(ref: {item['ref'][:7]})"
+                        )
+
+                    result = read_github_files(files)
+
+                except ValidationError as val_err:
+                    print(f"[Tool Error] Invalid arguments passed: {val_err}")
+                    result = f"Error: Tool arguments validation failed: {str(val_err)}"
+
+            else:
+                print(f"[Tool Error] Unknown tool requested: {function_name}")
+                result = f"Error: Unknown tool '{function_name}'"
+
+            # Add tool execution result back to messages
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }
+            )
+
+    return "Max iterations reached without a final report."
 
 def save_report(report: str, owner: str, repo: str, issue_num: int) -> Path:
     """Save the generated Markdown report beside this script."""
